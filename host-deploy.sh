@@ -3,56 +3,53 @@
 #
 # Coolify'un pre-deployment komutu SSH ile host'ta calisir → `docker` CLI
 # host'ta zaten var. Bu betik:
-#   1) ghcr.io token'ini bulur (app env dosyasindan)
+#   1) ghcr.io token'ini bulur (app env dosyasindan; bulamazsa app
+#      container'ina `docker exec` ile yayin yapar)
 #   2) registry'ye girer
 #   3) compose dosyasini public repodan indirir
 #   4) .env yazar
 #   5) `docker compose up -d` → 30 servis ayağa kalkar
-#   6) logu GitHub'a yazar (token bulunduysa)
 set -u
 
 LOG=/tmp/waas-host.log
 : > "${LOG}"
-UUID=b84g0oos48c40ssg4og4c8k0
+UUID=b84g0oos48c40ssg4og4c8k0"
 REPO=anilcetin/waas-deploy
 BASE="https://raw.githubusercontent.com/${REPO}/main"
+ENV_FILE=""
+GH=""
+APP_CONTAINER=""
 
-# --- Token'i bul ----------------------------------------------------------
-find_token() {
-  for f in \
-    "/data/coolify/applications/${UUID}/.env" \
-    "/data/coolify/applications/${UUID}/env" \
-    "/data/coolify/applications/${UUID}/.env.local" \
-    $(ls -t /artifacts/*/.env 2>/dev/null | head -3) \
-    $(ls -t /data/coolify/applications/*/.env 2>/dev/null | head -3)
-  do
-    [ -f "$f" ] || continue
-    v=$(grep -m1 '^GITHUB_TOKEN=' "$f" 2>/dev/null | cut -d= -f2- | tr -d '\r')
-    if [ -n "${v:-}" ]; then
-      ENV_FILE="$f"
-      printf '%s' "$v"
-      return 0
-    fi
-  done
-  if [ -n "${GITHUB_TOKEN:-}" ]; then
-    ENV_FILE="(environment)"
-    printf '%s' "$GITHUB_TOKEN"
-    return 0
-  fi
-  return 1
+app_container() {
+  [ -n "${APP_CONTAINER}" ] && { printf '%s' "${APP_CONTAINER}"; return 0; }
+  APP_CONTAINER=$(docker ps --filter "name=${UUID}" --format '{{.Names}}' 2>/dev/null | head -1)
+  [ -n "${APP_CONTAINER}" ] || return 1
+  printf '%s' "${APP_CONTAINER}"
 }
 
 publish() {
-  [ -n "${GH:-}" ] || return 0
   content=$(base64 < "${LOG}" 2>/dev/null | tr -d '\n')
-  printf '{"message":"host deploy log","content":"%s","branch":"main"}' "${content}" > /tmp/waas-payload.json
-  curl -s -X PUT \
-    -H "Authorization: Bearer ${GH}" \
-    -H "Accept: application/vnd.github+json" \
-    -H "Content-Type: application/json" \
-    --data @/tmp/waas-payload.json \
-    "https://api.github.com/repos/${REPO}/contents/host-log.txt" \
-    >/dev/null 2>&1 || true
+  payload="{\"message\":\"host deploy log\",\"content\":\"${content}\",\"branch\":\"main\"}"
+
+  # 1) Host'ta token varsa dogrudan yayinla.
+  if [ -n "${GH}" ]; then
+    printf '%s' "${payload}" > /tmp/waas-payload.json
+    curl -s -X PUT \
+      -H "Authorization: Bearer ${GH}" \
+      -H "Accept: application/vnd.github+json" \
+      -H "Content-Type: application/json" \
+      --data @/tmp/waas-payload.json \
+      "https://api.github.com/repos/${REPO}/contents/host-log.txt" \
+      >/dev/null 2>&1 && return 0
+  fi
+
+  # 2) Yoksa app container'ina docker exec ile yayinla
+  #    (container'in env'inde GITHUB_TOKEN var).
+  C=$(app_container) || return 1
+  printf '%s' "${payload}" > /tmp/waas-payload.json
+  docker cp /tmp/waas-payload.json "${C}:/tmp/waas-payload.json" >/dev/null 2>&1 || return 1
+  docker exec "${C}" sh -c 'curl -s -X PUT -H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github+json" -H "Content-Type: application/json" --data @/tmp/waas-payload.json "https://api.github.com/repos/anilcetin/waas-deploy/contents/host-log.txt" >/dev/null 2>&1' >/dev/null 2>&1
+  return 0
 }
 
 say() {
@@ -65,16 +62,34 @@ trap publish EXIT
 say "host deploy basladi (pwd=$(pwd))"
 say "docker: $(command -v docker 2>&1)"
 
-GH=$(find_token)
-if [ -n "${GH:-}" ]; then
+# --- Token'i bul ----------------------------------------------------------
+for f in \
+  "/data/coolify/applications/${UUID}/.env" \
+  "/data/coolify/applications/${UUID}/env" \
+  "/data/coolify/applications/${UUID}/.env.local" \
+  "/data/coolify/applications/${UUID}" \
+  $(ls -t /artifacts/*/.env 2>/dev/null | head -3) \
+  $(ls -t /data/coolify/applications/*/.env 2>/dev/null | head -3)
+do
+  [ -f "$f" ] || continue
+  v=$(grep -m1 '^GITHUB_TOKEN=' "$f" 2>/dev/null | cut -d= -f2- | tr -d '\r')
+  if [ -n "${v}" ]; then
+    ENV_FILE="$f"
+    GH="$v"
+    break
+  fi
+done
+
+if [ -n "${GH}" ]; then
   say "token bulundu: ${ENV_FILE}"
-  export GH
 else
-  say "token bulunamadi (app env dosyasini aradim)"
+  say "token bulunamadi (app env dosyasi arandi)"
+  say "artifacts: $(ls /artifacts 2>&1 | head -4 | tr '\n' ' ')"
+  say "applications: $(ls /data/coolify/applications 2>&1 | head -4 | tr '\n' ' ')"
 fi
 
 # --- Registry girisi ------------------------------------------------------
-if [ -n "${GH:-}" ]; then
+if [ -n "${GH}" ]; then
   printf '%s' "$GH" | docker login ghcr.io -u anilcetin --password-stdin >> "${LOG}" 2>&1
   say "docker login sonucu: $?"
 fi
@@ -88,10 +103,9 @@ curl -s -o postgres-init/01-extensions.sql "${BASE}/postgres-init/01-extensions.
 say "postgres-init indirildi: $(wc -c < postgres-init/01-extensions.sql) bayt"
 
 # --- .env -----------------------------------------------------------------
-ENV_FILE_USED="${ENV_FILE:-}"
-if [ -n "${ENV_FILE_USED}" ] && [ -f "${ENV_FILE_USED}" ]; then
-  grep -E '^(ROOT_DOMAIN|POSTGRES_USER|POSTGRES_PASSWORD|POSTGRES_DB|ADMIN_EMAIL|ADMIN_PASSWORD|ADMIN_IP_ALLOWLIST|COOKIE_DOMAIN|CORS_ALLOWED_ORIGINS|SITE_BASE_HOST|SITES_SUBDOMAIN|CNAME_TARGET|MEDIA_PUBLIC_BASE_URL|API_PUBLIC_URL|STOREFRONT_SITE_URL|ADMIN_PORTAL_SITE_URL|CUSTOMER_PORTAL_SITE_URL|THEME_ROUTER_SITE_URL|STRIPE_SECRET_KEY_LIVE|STRIPE_WEBHOOK_SECRET|Email__Provider|Email__Mailjet__ApiKey|Email__Mailjet__ApiSecret|Email__FromEmail|Email__FromName|Email__NotificationRecipient)=' "${ENV_FILE_USED}" > .env
-  say ".env kopyalandi: ${ENV_FILE_USED} ($(wc -l < .env) satir)"
+if [ -n "${ENV_FILE}" ] && [ -f "${ENV_FILE}" ]; then
+  grep -E '^(ROOT_DOMAIN|POSTGRES_USER|POSTGRES_PASSWORD|POSTGRES_DB|ADMIN_EMAIL|ADMIN_PASSWORD|ADMIN_IP_ALLOWLIST|COOKIE_DOMAIN|CORS_ALLOWED_ORIGINS|SITE_BASE_HOST|SITES_SUBDOMAIN|CNAME_TARGET|MEDIA_PUBLIC_BASE_URL|API_PUBLIC_URL|STOREFRONT_SITE_URL|ADMIN_PORTAL_SITE_URL|CUSTOMER_PORTAL_SITE_URL|THEME_ROUTER_SITE_URL|STRIPE_SECRET_KEY_LIVE|STRIPE_WEBHOOK_SECRET|Email__Provider|Email__Mailjet__ApiKey|Email__Mailjet__ApiSecret|Email__FromEmail|Email__FromName|Email__NotificationRecipient)=' "${ENV_FILE}" > .env
+  say ".env kopyalandi: ${ENV_FILE} ($(wc -l < .env) satir)"
 else
   cat > .env <<EOF
 ROOT_DOMAIN=webyono.com
