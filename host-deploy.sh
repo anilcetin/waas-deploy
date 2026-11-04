@@ -13,7 +13,7 @@ set -u
 
 LOG=/tmp/waas-host.log
 : > "${LOG}"
-UUID=b84g0oos48c40ssg4og4c8k0"
+UUID=b84g0oos48c40ssg4og4c8k0
 REPO=anilcetin/waas-deploy
 BASE="https://raw.githubusercontent.com/${REPO}/main"
 ENV_FILE=""
