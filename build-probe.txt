@@ -1,0 +1,1 @@
+socket=NO cli=/usr/local/bin/docker daemon=FAIL
