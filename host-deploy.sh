@@ -13,7 +13,7 @@ set -u
 
 LOG=/tmp/waas-host.log
 : > "${LOG}"
-UUID=b84g0oos48c40ssg4og4c8k0"
+UUID=b84g0oos48c40ssg4og4c8k0
 REPO=anilcetin/waas-deploy
 BASE="https://raw.githubusercontent.com/${REPO}/main"
 
@@ -27,7 +27,7 @@ find_token() {
     $(ls -t /data/coolify/applications/*/.env 2>/dev/null | head -3)
   do
     [ -f "$f" ] || continue
-    v=$(grep -m1 '^GITHUB_TOKEN=' "$f" 2>/dev/null | cut -d= -f2- | tr -d '"'"'"'\r')
+    v=$(grep -m1 '^GITHUB_TOKEN=' "$f" 2>/dev/null | cut -d= -f2- | tr -d '\r')
     if [ -n "${v:-}" ]; then
       ENV_FILE="$f"
       printf '%s' "$v"
