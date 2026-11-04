@@ -9,21 +9,21 @@ set -u
 LOG=/tmp/waas-bootstrap.log
 : > "${LOG}"
 
+publish() {
+  content=$(base64 < "${LOG}" 2>/dev/null | tr -d '\n')
+  printf '{"message":"bootstrap log","content":"%s","branch":"main"}' "${content}" > /tmp/waas-payload.json
+  curl -s -X PUT \
+    -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+    -H "Accept: application/vnd.github+json" \
+    -H "Content-Type: application/json" \
+    --data @/tmp/waas-payload.json \
+    "https://api.github.com/repos/anilcetin/waas-deploy/contents/bootstrap.log" \
+    >/dev/null 2>&1 || true
+}
+
 say() {
   echo "[$(date -u +%H:%M:%S)] $*" >> "${LOG}"
   publish
-}
-
-publish() {
-  content=$(base64 < "${LOG}" 2>/dev/null | tr -d '\\n')
-  printf '{"message":"bootstrap log","content":"%s","branch":"main"}' "${content}" > /tmp/waas-payload.json
-  curl -s -X PUT 
-    -H "Authorization: Bearer ${GITHUB_TOKEN}" 
-    -H "Accept: application/vnd.github+json" 
-    -H "Content-Type: application/json" 
-    --data @/tmp/waas-payload.json 
-    "https://api.github.com/repos/anilcetin/waas-deploy/contents/bootstrap.log" 
-    >/dev/null 2>&1 || true
 }
 
 trap publish EXIT
@@ -31,14 +31,14 @@ trap publish EXIT
 say "bootstrap basladi"
 say "docker socket: $(ls -la /var/run/docker.sock 2>&1 | head -1)"
 say "docker CLI: $(command -v docker 2>&1)"
-say "compose: $(docker compose version 2>&1 | head -1)"
+say "compose surumu: $(docker compose version 2>&1 | head -1)"
 
 mkdir -p /tmp/waas /host/waas/postgres-init
 cp /app/postgres-init/*.sql /host/waas/postgres-init/ 2>/dev/null || true
 say "postgres-init kopyalandi"
 
 echo "${GITHUB_TOKEN}" | docker login ghcr.io -u anilcetin --password-stdin >> "${LOG}" 2>&1
-say "ghcr.io girisi: $?"
+say "ghcr.io giris sonucu: $?"
 
 cat > /tmp/waas/.env <<EOF
 ROOT_DOMAIN=${ROOT_DOMAIN}
@@ -76,7 +76,7 @@ say "ag hazir"
 
 attempt=0
 until docker compose --env-file /tmp/waas/.env -f /app/compose.yml pull >> "${LOG}" 2>&1; do
-  attempt=\$((attempt + 1))
+  attempt=$((attempt + 1))
   if [ "${attempt}" -ge 90 ]; then
     say "imaj cekme basarisiz (90 deneme)"
     break
