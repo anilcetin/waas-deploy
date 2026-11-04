@@ -1,0 +1,1064 @@
+# ⚠️ ÜRETİLMİŞ DOSYA — elle düzenleme!
+#
+# Kaynak: infrastructure/docker/docker-compose.prod.yml
+#         infrastructure/docker/docker-compose.theme.yml
+#         apps/themes/themes.json (TEK tema kataloğu)
+# Üretici: scripts/generate-prod-compose.mjs
+#
+# Coolify → New Resource → Docker Compose → "Compose Content" olarak yapıştır.
+# (Kaynak: GitHub repo → path: /infrastructure/docker/docker-compose.prod.all.yml)
+#
+# 22 tema + 7 platform servisi = 29 servis.
+# Ağ: edge = "coolify" (Coolify'in Traefik proxy ağı).
+
+name: waas-platform-prod
+
+# Coolify PRODUCTION compose — Traefik-managed HTTPS, internal-only postgres.
+# Coolify injects environment variables; do NOT use env_file here.
+#
+# Kök domain = `ROOT_DOMAIN` (webyono.com). Tüm public URL'ler ve Traefik
+# host kuralları TEK top düğmeden (`ROOT_DOMAIN`) türer.
+#
+# Host haritası (K8 / ADR-0003 + webyono.com apex kararı):
+#   webyono.com             -> storefront   (apex — satış + SEO kökü)
+#   www.webyono.com         -> storefront   (308 → apex; uygulama içi proxy)
+#   admin.webyono.com       -> admin-portal
+#   app.webyono.com         -> customer-portal
+#   api.webyono.com         -> Platform API
+#   sites.webyono.com       -> theme-router (catch-all; CNAME hedefi)
+#   *.sites.webyono.com     -> theme-router (otomatik site host'ları)
+#   <müşteri domain'i>      -> theme-router (catch-all; CNAME ile)
+#
+# Postgres + adminer yalnızca platform-içi Docker ağından erişilebilir.
+# Host portu yok, Traefik label'ı yok.
+#
+# NOT — tema uygulamaları bu compose'ta YOK: her tema ayrı bir Next.js
+# projesidir (ADR-0004 K15) ve ayrı Coolify resource olarak deploy edilir.
+# Router'ın proxy hedefi `THEME_APP_<SLUG>_URL` env'i ile verilir
+# (bkz. Docs/DEPLOYMENT.md §10.8).
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: waas-postgres-prod
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-platform}
+    volumes:
+      - postgres_data_prod:/var/lib/postgresql/data
+      # ⚠️ `POSTGRES_INIT_DIR` mutlak yol olmalı — compose dosyası sunucuda
+      # başka bir dizinden çalışıyor olabilir (bootstrap imajı). Varsayılan
+      # göreli yol (`./postgres-init`) yalnız compose'un bulunduğu dizinde
+      # postgres-init/ varsa çalışır.
+      - ${POSTGRES_INIT_DIR:-./postgres-init}:/docker-entrypoint-initdb.d:ro
+    networks:
+      - platform-internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    # No `ports:` — internal only.
+
+  api:
+    image: ghcr.io/anilcetin/waas-api:prod
+    container_name: waas-api-prod
+    restart: unless-stopped
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      ASPNETCORE_URLS: http://+:8080
+      # ASP.NET Core maps ConnectionStrings__Default → ConnectionStrings:Default
+      # (double-underscore → ':' section separator).
+      ConnectionStrings__Default: Host=postgres;Database=${POSTGRES_DB:-platform};Username=${POSTGRES_USER};Password=${POSTGRES_PASSWORD};Port=5432
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-platform}
+      # .NET options pattern: "Stripe__SecretKey" → config "Stripe:SecretKey".
+      Stripe__SecretKey: ${STRIPE_SECRET_KEY_LIVE}
+      Stripe__WebhookSecret: ${STRIPE_WEBHOOK_SECRET}
+      # Checkout dönüş URL'lerinin tabanı = storefront (kök domain).
+      Stripe__StorefrontBaseUrl: ${STOREFRONT_SITE_URL:-https://${ROOT_DOMAIN:-webyono.com}}
+      # Döviz kuru (Sprint 13 — TL gösterim). Tahsilat EUR'da kalır (K7).
+      Fx__Enabled: ${Fx__Enabled:-true}
+      Fx__FallbackEurTryRate: ${Fx__FallbackEurTryRate:-45.00}
+      Fx__RateUrl: ${Fx__RateUrl:-https://api.frankfurter.app/latest?from=EUR&to=TRY}
+      Fx__CacheMinutes: ${Fx__CacheMinutes:-60}
+      # Kök domain'e bağlı auth cookie → api. / app. / storefront. arası
+      # paylaşılır. Tanımsızsa storefront checkout `409 customer_not_registered`
+      # ile reddedilir (CONFIG-REFERENCE.md §5.2).
+      COOKIE_DOMAIN: ${COOKIE_DOMAIN:-${ROOT_DOMAIN:-webyono.com}}
+      # CORS — tarayıcıdan API'ye DOĞRUDAN gelen origin'ler (Sprint 19 /
+      # Chunk 101). Virgülle ayrılır; boşsa CORS hiç uygulanmaz.
+      # ⚠️ "*" yazılmaz: cookie'li (credentialed) isteklerde geçersizdir.
+      CORS_ALLOWED_ORIGINS: "${CORS_ALLOWED_ORIGINS:-https://${ROOT_DOMAIN:-webyono.com},https://www.${ROOT_DOMAIN:-webyono.com},https://admin.${ROOT_DOMAIN:-webyono.com},https://app.${ROOT_DOMAIN:-webyono.com}}"
+      # Kullanıcıya giden linklerin tabanı → CUSTOMER portal.
+      Platform__PublicBaseUrl: ${CUSTOMER_PORTAL_SITE_URL:-https://app.${ROOT_DOMAIN:-webyono.com}}
+      # K8 / ADR-0003 — hosting & domain modeli:
+      Platform__Hosting__BaseHost: ${SITE_BASE_HOST:-${ROOT_DOMAIN:-webyono.com}}
+      Platform__Hosting__SitesSubdomain: ${SITES_SUBDOMAIN:-sites}
+      Platform__Hosting__CnameTarget: ${CNAME_TARGET:-sites.${ROOT_DOMAIN:-webyono.com}}
+      # Admin bootstrap — Production'da ZORUNLU. Parola yoksa API
+      # başlatılırken fail-fast yapar → container healthy olmaz, rollout durur.
+      Platform__Bootstrap__DefaultAdminEmail: ${ADMIN_EMAIL}
+      Platform__Bootstrap__DefaultAdminPassword: ${ADMIN_PASSWORD}
+      # Gerçek e-posta gönderimi (production'da Mailjet zorunlu).
+      Email__Provider: ${Email__Provider:-Mailjet}
+      Email__Mailjet__ApiKey: ${Email__Mailjet__ApiKey}
+      Email__Mailjet__ApiSecret: ${Email__Mailjet__ApiSecret}
+      Email__FromEmail: ${Email__FromEmail:-no-reply@${ROOT_DOMAIN:-webyono.com}}
+      Email__FromName: ${Email__FromName:-WebYono}
+      Email__NotificationRecipient: ${Email__NotificationRecipient:-ops@${ROOT_DOMAIN:-webyono.com}}
+      # Medya adresleri — MUTLAK (public) adres. Varsayılan `/media` göreli
+      # adres üretir → tema uygulaması (`<slug>.sites.<kök>`, farklı origin)
+      # medyayı yanlış host'ta arar → kırık görsel. Mutlak public adres
+      # API'den doğrudan gelir ve tema CSP'sindeki `img-src` origin'iyle
+      # (public API) eşleşir.
+      Media__PublicBaseUrl: ${MEDIA_PUBLIC_BASE_URL:-https://api.webyono.com/media}
+      # Medya diski KALICI olmalı. `Media:StorageRoot` `wwwroot/media`
+      # altında kalmalı (aksi halde ASP.NET statik dosya servisi
+      # (`app.UseStaticFiles()` → `wwwroot`) dosyaları servis etmez).
+      # Coolify'da API servisine `/app/wwwroot/media` yoluna volume
+      # bağlanmalı (Docs/DEPLOYMENT.md §7).
+    volumes:
+      - waas_media_prod:/app/wwwroot/media
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - platform-internal
+      - edge
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8080/health/ready"]
+      interval: 20s
+      timeout: 5s
+      retries: 4
+      start_period: 30s
+    labels:
+      - "traefik.enable=true"
+      # ⚠️ `priority=100` — sunucuda `api.webyono.com` için **eski bir
+      # Coolify uygulaması** daha var (bootstrap işi için kullanıldı).
+      # Yüksek öncelik → compose'in API router'ı her zaman kazanır.
+      - "traefik.http.routers.api.priority=100"
+      - "traefik.http.routers.api.rule=Host(`api.${ROOT_DOMAIN:-webyono.com}`)"
+      - "traefik.http.routers.api.entrypoints=websecure"
+      - "traefik.http.routers.api.tls.certresolver=letsencrypt"
+      - "traefik.http.services.api.loadbalancer.server.port=8080"
+
+  # Worker — abonelik yenileme hatırlatması (Sprint 17 / Chunk 84).
+  #
+  # Worker HTTP DİNLEMEZ; yalnızca DB'ye bağlanıp e-posta gönderir.
+  # Bu yüzden:
+  #   * `ports:` YOK, Traefik label'ı YOK → public erişim yok,
+  #   * yalnızca `platform-internal` ağı (DB) + `edge` (ağ geçişi için
+  #     gerekmiyor ama API ile aynı ağda olmak konvansiyon),
+  #   * `depends_on: postgres (healthy)` → DB hazır olmadan başlamaz.
+  #
+  # Worker prod'da olmazsa yenileme e-postası HİÇ GİTMEZ (Sprint 16 ölçümü).
+  worker:
+    image: ghcr.io/anilcetin/waas-worker:prod
+    container_name: waas-worker-prod
+    restart: unless-stopped
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      # ASP.NET Core maps ConnectionStrings__Default → ConnectionStrings:Default
+      # (double-underscore → ':' section separator). Worker API ile AYNI DB'yi
+      # okur (Subscription) — aynı Postgres servisi, aynı bağlantı dizesi.
+      ConnectionStrings__Default: Host=postgres;Database=${POSTGRES_DB:-platform};Username=${POSTGRES_USER};Password=${POSTGRES_PASSWORD};Port=5432
+      # E-posta bağlantılarının tabanı → CUSTOMER portal (app.).
+      Platform__PublicBaseUrl: ${CUSTOMER_PORTAL_SITE_URL:-https://app.${ROOT_DOMAIN:-webyono.com}}
+      # Gerçek e-posta gönderimi (production'da Mailjet zorunlu).
+      Email__Provider: ${Email__Provider:-Mailjet}
+      Email__Mailjet__ApiKey: ${Email__Mailjet__ApiKey}
+      Email__Mailjet__ApiSecret: ${Email__Mailjet__ApiSecret}
+      Email__FromEmail: ${Email__FromEmail:-no-reply@${ROOT_DOMAIN:-webyono.com}}
+      Email__FromName: ${Email__FromName:-WebYono}
+      Email__NotificationRecipient: ${Email__NotificationRecipient:-ops@${ROOT_DOMAIN:-webyono.com}}
+      # Abonelik yenileme hatırlatması penceresi (gün) + tarama periyodu.
+      # ⚠️ Bu iki değer olmadan Worker default'a düşer (7 gün / 24 saat).
+      Renewal__ReminderDaysBefore: ${Renewal__ReminderDaysBefore:-7}
+      Renewal__IntervalHours: ${Renewal__IntervalHours:-24}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - platform-internal
+    healthcheck:
+      # Worker'ın HTTP ucu yok → liveness = süreç ayakta mı.
+      test: ["CMD-SHELL", "pgrep -f Platform.Worker.dll > /dev/null || exit 1"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  storefront:
+    image: ghcr.io/anilcetin/waas-storefront:prod
+    container_name: waas-storefront-prod
+    restart: unless-stopped
+    environment:
+      # Runtime (build-time değil) domain/URL config — container restart ile
+      # değiştirilebilir, rebuild gerektirmez.
+      SITE_URL: ${STOREFRONT_SITE_URL:-https://${ROOT_DOMAIN:-webyono.com}}
+      API_URL: ${API_PUBLIC_URL:-https://api.${ROOT_DOMAIN:-webyono.com}}
+      NEXT_PUBLIC_API_URL: ${API_PUBLIC_URL:-https://api.${ROOT_DOMAIN:-webyono.com}}
+      # Satın alma akışı: giriş (müteri portalı) ve "sitemi oluştur" adımları.
+      CUSTOMER_PORTAL_URL: ${CUSTOMER_PORTAL_SITE_URL:-https://app.${ROOT_DOMAIN:-webyono.com}}
+      STOREFRONT_URL: ${STOREFRONT_SITE_URL:-https://${ROOT_DOMAIN:-webyono.com}}
+      # Tema router adresi — K20 vitrin iframe'i (görseli olmayan temada canlı
+      # önizleme) ve "tema vitrini" bağlantıları bu adresi kullanır. Eksik
+      # kalırsa localhost'a düşer → üretimde vitrine iframe'i ölür.
+      THEME_ROUTER_URL: ${THEME_ROUTER_SITE_URL:-https://sites.${ROOT_DOMAIN:-webyono.com}}
+      NODE_ENV: production
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - edge
+    labels:
+      - "traefik.enable=true"
+      # Apex + www aynı servise gider; `www` → apex 308 yönlendirmesini
+      # uygulamanın kendi proxy'si yapar (Traefik redirect middleware 308
+      # desteklemez — yalnız 301/302).
+      - "traefik.http.routers.storefront.rule=Host(`${ROOT_DOMAIN:-webyono.com}`) || Host(`www.${ROOT_DOMAIN:-webyono.com}`)"
+      - "traefik.http.routers.storefront.entrypoints=websecure"
+      - "traefik.http.routers.storefront.tls.certresolver=letsencrypt"
+      - "traefik.http.services.storefront.loadbalancer.server.port=3000"
+
+  customer-portal:
+    image: ghcr.io/anilcetin/waas-customer-portal:prod
+    container_name: waas-customer-portal-prod
+    restart: unless-stopped
+    environment:
+      SITE_URL: ${CUSTOMER_PORTAL_SITE_URL:-https://app.${ROOT_DOMAIN:-webyono.com}}
+      API_URL: ${API_PUBLIC_URL:-https://api.${ROOT_DOMAIN:-webyono.com}}
+      NEXT_PUBLIC_API_URL: ${API_PUBLIC_URL:-https://api.${ROOT_DOMAIN:-webyono.com}}
+      STOREFRONT_URL: ${STOREFRONT_SITE_URL:-https://${ROOT_DOMAIN:-webyono.com}}
+      # Tema router — panelden "siteyi görüntüle" bağlantıları.
+      THEME_ROUTER_URL: ${THEME_ROUTER_SITE_URL:-https://sites.${ROOT_DOMAIN:-webyono.com}}
+      NODE_ENV: production
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - edge
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.customer-portal.rule=Host(`app.${ROOT_DOMAIN:-webyono.com}`)"
+      - "traefik.http.routers.customer-portal.entrypoints=websecure"
+      - "traefik.http.routers.customer-portal.tls.certresolver=letsencrypt"
+      - "traefik.http.services.customer-portal.loadbalancer.server.port=80"
+
+  admin-portal:
+    image: ghcr.io/anilcetin/waas-admin-portal:prod
+    container_name: waas-admin-portal-prod
+    restart: unless-stopped
+    environment:
+      SITE_URL: ${ADMIN_PORTAL_SITE_URL:-https://admin.${ROOT_DOMAIN:-webyono.com}}
+      API_URL: ${API_PUBLIC_URL:-https://api.${ROOT_DOMAIN:-webyono.com}}
+      NEXT_PUBLIC_API_URL: ${API_PUBLIC_URL:-https://api.${ROOT_DOMAIN:-webyono.com}}
+      # Tema router — panelden "siteyi görüntüle" bağlantıları.
+      THEME_ROUTER_URL: ${THEME_ROUTER_SITE_URL:-https://sites.${ROOT_DOMAIN:-webyono.com}}
+      # Admin IP allowlist (Sprint 19 / Chunk 106) — nginx katmanında
+      # uygulanır. Boşsa kısıt YOK (kısıt varsa panel yalnız bu
+      # IP'lerden açılır).
+      ADMIN_IP_ALLOWLIST: ${ADMIN_IP_ALLOWLIST:-}
+      NODE_ENV: production
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - edge
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.admin-portal.rule=Host(`admin.${ROOT_DOMAIN:-webyono.com}`)"
+      - "traefik.http.routers.admin-portal.entrypoints=websecure"
+      - "traefik.http.routers.admin-portal.tls.certresolver=letsencrypt"
+      - "traefik.http.services.admin-portal.loadbalancer.server.port=80"
+
+  adminer:
+    image: adminer:latest
+    container_name: waas-adminer-prod
+    restart: unless-stopped
+    environment:
+      ADMINER_DEFAULT_SERVER: postgres
+    networks:
+      - platform-internal
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # No ports or Traefik labels — internal-only, reachable via `docker exec`.
+
+  # Tema router — K8 / ADR-0003 §4 (catch-all host yönlendirmesi).
+  #
+  # Müşteri siteleri hem platformun `*.sites.<base>` ad alanında hem de
+  # KENDİ domain'inde (CNAME ile buraya) yayınlanır. Host listesi sabit
+  # olmadığı için Traefik `Host(...)` yerine **catch-all** `HostRegexp`
+  # kullanılır; explicit `priority=1` ile panel/API/storefront kuralları
+  # (yüksek priority) catch-all'i YUTMAZ.
+  #
+  # SERTİFİKA: catch-all için `letsencrypt-ondemand` resolver kullanılır —
+  # Traefik sertifikayı sadece **gerçekten kayıtlı bir site host'u** için
+  # ister (askVerdict → API'nin public resolve ucu). Gerekli static config
+  # (Coolify Traefik) DEPLOYMENT.md §10.7'de.
+  theme-router:
+    image: ghcr.io/anilcetin/waas-theme-router:prod
+    container_name: waas-theme-router-prod
+    restart: unless-stopped
+    environment:
+      # Runtime (build-time değil) config — router'ın kendi adresi + API adresi.
+      SITE_URL: ${THEME_ROUTER_SITE_URL:-https://sites.${ROOT_DOMAIN:-webyono.com}}
+      THEME_ROUTER_URL: ${THEME_ROUTER_SITE_URL:-https://sites.${ROOT_DOMAIN:-webyono.com}}
+      API_URL: ${API_PUBLIC_URL:-https://api.${ROOT_DOMAIN:-webyono.com}}
+      NEXT_PUBLIC_API_URL: ${API_PUBLIC_URL:-https://api.${ROOT_DOMAIN:-webyono.com}}
+      # Tema uygulamalarının iç adresleri (ADR-0004 K15 — her tema AYRI bir
+      # Coolify resource; slug → env anahtarı eşlemesi tek kaynaktan:
+      # apps/themes/themes.json + packages/config themeAppEnvKey()).
+      # Değerler `edge` ağındaki service adresleridir — dışarıdan doğrudan
+      # erişilemez (host → theme-router proxy'si).
+      THEME_APP_RESTORAN_KAFE_URL: ${THEME_APP_RESTORAN_KAFE_URL:-http://theme-restoran-kafe:3000}
+      THEME_APP_KUAFOR_GUZELLIK_URL: ${THEME_APP_KUAFOR_GUZELLIK_URL:-http://theme-kuafor-guzellik:3000}
+      THEME_APP_HUKUK_BUROSU_URL: ${THEME_APP_HUKUK_BUROSU_URL:-http://theme-hukuk-burosu:3000}
+      THEME_APP_EMLAK_GAYRIMENKUL_URL: ${THEME_APP_EMLAK_GAYRIMENKUL_URL:-http://theme-emlak-gayrimenkul:3000}
+      THEME_APP_DIS_KLINIK_URL: ${THEME_APP_DIS_KLINIK_URL:-http://theme-dis-klinik:3000}
+      THEME_APP_INSAAT_YAPI_URL: ${THEME_APP_INSAAT_YAPI_URL:-http://theme-insaat-yapi:3000}
+      THEME_APP_EGITIM_KURS_URL: ${THEME_APP_EGITIM_KURS_URL:-http://theme-egitim-kurs:3000}
+      THEME_APP_PERAKENDE_MAGAZA_URL: ${THEME_APP_PERAKENDE_MAGAZA_URL:-http://theme-perakende-magaza:3000}
+      THEME_APP_OTEL_KONAKLAMA_URL: ${THEME_APP_OTEL_KONAKLAMA_URL:-http://theme-otel-konaklama:3000}
+      THEME_APP_SPOR_SALONU_URL: ${THEME_APP_SPOR_SALONU_URL:-http://theme-spor-salonu:3000}
+      THEME_APP_RESTORAN_KAFE_MODERN_URL: ${THEME_APP_RESTORAN_KAFE_MODERN_URL:-http://theme-restoran-kafe-modern:3000}
+      THEME_APP_KUAFOR_GUZELLIK_ELEGANT_URL: ${THEME_APP_KUAFOR_GUZELLIK_ELEGANT_URL:-http://theme-kuafor-guzellik-elegant:3000}
+      THEME_APP_HUKUK_BUROSU_CEKIM_URL: ${THEME_APP_HUKUK_BUROSU_CEKIM_URL:-http://theme-hukuk-burosu-cekim:3000}
+      THEME_APP_EMLAK_VITRIN_MODERN_URL: ${THEME_APP_EMLAK_VITRIN_MODERN_URL:-http://theme-emlak-vitrin-modern:3000}
+      THEME_APP_DIS_KLINIK_MODERN_URL: ${THEME_APP_DIS_KLINIK_MODERN_URL:-http://theme-dis-klinik-modern:3000}
+      THEME_APP_INSAAT_YAPI_MODERN_URL: ${THEME_APP_INSAAT_YAPI_MODERN_URL:-http://theme-insaat-yapi-modern:3000}
+      THEME_APP_EGITIM_KURS_ONLINE_URL: ${THEME_APP_EGITIM_KURS_ONLINE_URL:-http://theme-egitim-kurs-online:3000}
+      THEME_APP_PERAKENDE_MAGAZA_MODERN_URL: ${THEME_APP_PERAKENDE_MAGAZA_MODERN_URL:-http://theme-perakende-magaza-modern:3000}
+      THEME_APP_OTEL_BOUTIQUE_URL: ${THEME_APP_OTEL_BOUTIQUE_URL:-http://theme-otel-boutique:3000}
+      THEME_APP_SPOR_SALONU_MODERN_URL: ${THEME_APP_SPOR_SALONU_MODERN_URL:-http://theme-spor-salonu-modern:3000}
+      THEME_APP_DIS_KLINIK_LUXE_URL: ${THEME_APP_DIS_KLINIK_LUXE_URL:-http://theme-dis-klinik-luxe:3000}
+      THEME_APP_RESTORAN_KAFE_BISTRO_URL: ${THEME_APP_RESTORAN_KAFE_BISTRO_URL:-http://theme-restoran-kafe-bistro:3000}
+      DEFAULT_THEME_APP_URL: ${DEFAULT_THEME_APP_URL:-http://theme-dis-klinik:3000}
+      NODE_ENV: production
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - edge
+    labels:
+      - "traefik.enable=true"
+      # ⚠️ İKİ AYRI ROUTER:
+      #
+      # 1) `sites.<kök>` → **normal** `letsencrypt` resolver (Coolify'ın
+      #    varsayılan resolver'ı — static config gerekmez). CNAME hedefi.
+      # 2) catch-all (`<müşteri domain>` · `*.sites.<kök>`) → **on-demand**
+      #    resolver (DEPLOYMENT.md §10.7 static config'i gerekir).
+      #
+      # Neden ayrı? `letsencrypt-ondemand` resolver'ı yoksa Traefik o
+      # router'ı **yükleyemez** → `sites.<kök>` de düşerdi. Ayrılmış halde
+      # `sites.<kök>` her zaman çalışır; catch-all ise static config eklenince
+      # devreye girer.
+      - "traefik.http.routers.theme-router-sites.rule=Host(`sites.${ROOT_DOMAIN:-webyono.com}`)"
+      - "traefik.http.routers.theme-router-sites.entrypoints=websecure"
+      - "traefik.http.routers.theme-router-sites.tls.certresolver=letsencrypt"
+      - "traefik.http.services.theme-router-sites.loadbalancer.server.port=3000"
+      - "traefik.http.routers.theme-router.rule=HostRegexp(`{host:.+}`)"
+      - "traefik.http.routers.theme-router.priority=1"
+      - "traefik.http.routers.theme-router.entrypoints=websecure"
+      - "traefik.http.routers.theme-router.tls.certresolver=letsencrypt-ondemand"
+      - "traefik.http.routers.theme-router.tls.ondemand=true"
+      - "traefik.http.services.theme-router.loadbalancer.server.port=3000"
+
+  theme-restoran-kafe:
+    # ADR-0022 (K22) — registry referansı. `THEME_IMAGE` tanımlıysa CI'da
+    # push edilen imaj kullanılır; `pull_policy: always` ile sunucu her
+    # deploy'da registry'den çeker (build YOK → build cache 0).
+    image: ghcr.io/anilcetin/waas-theme-restoran-kafe:prod
+    container_name: waas-theme-restoran-kafe
+    restart: unless-stopped
+    environment:
+      # Platform API — SUNUCU TARAFI (theme-runtime `readApiUrl`).
+      # `edge` ağındaki API servisinin İÇ adresi (public DNS/TLS turu yok).
+      API_URL: http://api:8080
+      # Client bundle'a build-time inline edilir → PUBLIC adres olmalı.
+      NEXT_PUBLIC_API_URL: "https://api.${ROOT_DOMAIN:-webyono.com}"
+      # Sunucu-only alternatif (readApiUrl öncelik listesi).
+      PLATFORM_API_URL: http://api:8080
+      # Tema uygulamasının "kendi" adresi → router adresi (tema siteleri
+      # router üzerinden servis edilir).
+      SITE_URL: "https://sites.${ROOT_DOMAIN:-webyono.com}"
+      NODE_ENV: production
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      edge:
+        # Router bu ada ile çözer: `http://theme-<slug>:3000`
+        # (compose servis adı interpolate EDİLEMEZ → alias ile çözülür).
+        aliases:
+          - theme-restoran-kafe
+    # NO `ports:` — host'a publish edilmez.
+    # NO Traefik label — doğrudan public erişim YOK (host → router proxy).
+
+  theme-kuafor-guzellik:
+    # ADR-0022 (K22) — registry referansı. `THEME_IMAGE` tanımlıysa CI'da
+    # push edilen imaj kullanılır; `pull_policy: always` ile sunucu her
+    # deploy'da registry'den çeker (build YOK → build cache 0).
+    image: ghcr.io/anilcetin/waas-theme-kuafor-guzellik:prod
+    container_name: waas-theme-kuafor-guzellik
+    restart: unless-stopped
+    environment:
+      # Platform API — SUNUCU TARAFI (theme-runtime `readApiUrl`).
+      # `edge` ağındaki API servisinin İÇ adresi (public DNS/TLS turu yok).
+      API_URL: http://api:8080
+      # Client bundle'a build-time inline edilir → PUBLIC adres olmalı.
+      NEXT_PUBLIC_API_URL: "https://api.${ROOT_DOMAIN:-webyono.com}"
+      # Sunucu-only alternatif (readApiUrl öncelik listesi).
+      PLATFORM_API_URL: http://api:8080
+      # Tema uygulamasının "kendi" adresi → router adresi (tema siteleri
+      # router üzerinden servis edilir).
+      SITE_URL: "https://sites.${ROOT_DOMAIN:-webyono.com}"
+      NODE_ENV: production
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      edge:
+        # Router bu ada ile çözer: `http://theme-<slug>:3000`
+        # (compose servis adı interpolate EDİLEMEZ → alias ile çözülür).
+        aliases:
+          - theme-kuafor-guzellik
+    # NO `ports:` — host'a publish edilmez.
+    # NO Traefik label — doğrudan public erişim YOK (host → router proxy).
+
+  theme-hukuk-burosu:
+    # ADR-0022 (K22) — registry referansı. `THEME_IMAGE` tanımlıysa CI'da
+    # push edilen imaj kullanılır; `pull_policy: always` ile sunucu her
+    # deploy'da registry'den çeker (build YOK → build cache 0).
+    image: ghcr.io/anilcetin/waas-theme-hukuk-burosu:prod
+    container_name: waas-theme-hukuk-burosu
+    restart: unless-stopped
+    environment:
+      # Platform API — SUNUCU TARAFI (theme-runtime `readApiUrl`).
+      # `edge` ağındaki API servisinin İÇ adresi (public DNS/TLS turu yok).
+      API_URL: http://api:8080
+      # Client bundle'a build-time inline edilir → PUBLIC adres olmalı.
+      NEXT_PUBLIC_API_URL: "https://api.${ROOT_DOMAIN:-webyono.com}"
+      # Sunucu-only alternatif (readApiUrl öncelik listesi).
+      PLATFORM_API_URL: http://api:8080
+      # Tema uygulamasının "kendi" adresi → router adresi (tema siteleri
+      # router üzerinden servis edilir).
+      SITE_URL: "https://sites.${ROOT_DOMAIN:-webyono.com}"
+      NODE_ENV: production
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      edge:
+        # Router bu ada ile çözer: `http://theme-<slug>:3000`
+        # (compose servis adı interpolate EDİLEMEZ → alias ile çözülür).
+        aliases:
+          - theme-hukuk-burosu
+    # NO `ports:` — host'a publish edilmez.
+    # NO Traefik label — doğrudan public erişim YOK (host → router proxy).
+
+  theme-emlak-gayrimenkul:
+    # ADR-0022 (K22) — registry referansı. `THEME_IMAGE` tanımlıysa CI'da
+    # push edilen imaj kullanılır; `pull_policy: always` ile sunucu her
+    # deploy'da registry'den çeker (build YOK → build cache 0).
+    image: ghcr.io/anilcetin/waas-theme-emlak-gayrimenkul:prod
+    container_name: waas-theme-emlak-gayrimenkul
+    restart: unless-stopped
+    environment:
+      # Platform API — SUNUCU TARAFI (theme-runtime `readApiUrl`).
+      # `edge` ağındaki API servisinin İÇ adresi (public DNS/TLS turu yok).
+      API_URL: http://api:8080
+      # Client bundle'a build-time inline edilir → PUBLIC adres olmalı.
+      NEXT_PUBLIC_API_URL: "https://api.${ROOT_DOMAIN:-webyono.com}"
+      # Sunucu-only alternatif (readApiUrl öncelik listesi).
+      PLATFORM_API_URL: http://api:8080
+      # Tema uygulamasının "kendi" adresi → router adresi (tema siteleri
+      # router üzerinden servis edilir).
+      SITE_URL: "https://sites.${ROOT_DOMAIN:-webyono.com}"
+      NODE_ENV: production
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      edge:
+        # Router bu ada ile çözer: `http://theme-<slug>:3000`
+        # (compose servis adı interpolate EDİLEMEZ → alias ile çözülür).
+        aliases:
+          - theme-emlak-gayrimenkul
+    # NO `ports:` — host'a publish edilmez.
+    # NO Traefik label — doğrudan public erişim YOK (host → router proxy).
+
+  theme-dis-klinik:
+    # ADR-0022 (K22) — registry referansı. `THEME_IMAGE` tanımlıysa CI'da
+    # push edilen imaj kullanılır; `pull_policy: always` ile sunucu her
+    # deploy'da registry'den çeker (build YOK → build cache 0).
+    image: ghcr.io/anilcetin/waas-theme-dis-klinik:prod
+    container_name: waas-theme-dis-klinik
+    restart: unless-stopped
+    environment:
+      # Platform API — SUNUCU TARAFI (theme-runtime `readApiUrl`).
+      # `edge` ağındaki API servisinin İÇ adresi (public DNS/TLS turu yok).
+      API_URL: http://api:8080
+      # Client bundle'a build-time inline edilir → PUBLIC adres olmalı.
+      NEXT_PUBLIC_API_URL: "https://api.${ROOT_DOMAIN:-webyono.com}"
+      # Sunucu-only alternatif (readApiUrl öncelik listesi).
+      PLATFORM_API_URL: http://api:8080
+      # Tema uygulamasının "kendi" adresi → router adresi (tema siteleri
+      # router üzerinden servis edilir).
+      SITE_URL: "https://sites.${ROOT_DOMAIN:-webyono.com}"
+      NODE_ENV: production
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      edge:
+        # Router bu ada ile çözer: `http://theme-<slug>:3000`
+        # (compose servis adı interpolate EDİLEMEZ → alias ile çözülür).
+        aliases:
+          - theme-dis-klinik
+    # NO `ports:` — host'a publish edilmez.
+    # NO Traefik label — doğrudan public erişim YOK (host → router proxy).
+
+  theme-insaat-yapi:
+    # ADR-0022 (K22) — registry referansı. `THEME_IMAGE` tanımlıysa CI'da
+    # push edilen imaj kullanılır; `pull_policy: always` ile sunucu her
+    # deploy'da registry'den çeker (build YOK → build cache 0).
+    image: ghcr.io/anilcetin/waas-theme-insaat-yapi:prod
+    container_name: waas-theme-insaat-yapi
+    restart: unless-stopped
+    environment:
+      # Platform API — SUNUCU TARAFI (theme-runtime `readApiUrl`).
+      # `edge` ağındaki API servisinin İÇ adresi (public DNS/TLS turu yok).
+      API_URL: http://api:8080
+      # Client bundle'a build-time inline edilir → PUBLIC adres olmalı.
+      NEXT_PUBLIC_API_URL: "https://api.${ROOT_DOMAIN:-webyono.com}"
+      # Sunucu-only alternatif (readApiUrl öncelik listesi).
+      PLATFORM_API_URL: http://api:8080
+      # Tema uygulamasının "kendi" adresi → router adresi (tema siteleri
+      # router üzerinden servis edilir).
+      SITE_URL: "https://sites.${ROOT_DOMAIN:-webyono.com}"
+      NODE_ENV: production
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      edge:
+        # Router bu ada ile çözer: `http://theme-<slug>:3000`
+        # (compose servis adı interpolate EDİLEMEZ → alias ile çözülür).
+        aliases:
+          - theme-insaat-yapi
+    # NO `ports:` — host'a publish edilmez.
+    # NO Traefik label — doğrudan public erişim YOK (host → router proxy).
+
+  theme-egitim-kurs:
+    # ADR-0022 (K22) — registry referansı. `THEME_IMAGE` tanımlıysa CI'da
+    # push edilen imaj kullanılır; `pull_policy: always` ile sunucu her
+    # deploy'da registry'den çeker (build YOK → build cache 0).
+    image: ghcr.io/anilcetin/waas-theme-egitim-kurs:prod
+    container_name: waas-theme-egitim-kurs
+    restart: unless-stopped
+    environment:
+      # Platform API — SUNUCU TARAFI (theme-runtime `readApiUrl`).
+      # `edge` ağındaki API servisinin İÇ adresi (public DNS/TLS turu yok).
+      API_URL: http://api:8080
+      # Client bundle'a build-time inline edilir → PUBLIC adres olmalı.
+      NEXT_PUBLIC_API_URL: "https://api.${ROOT_DOMAIN:-webyono.com}"
+      # Sunucu-only alternatif (readApiUrl öncelik listesi).
+      PLATFORM_API_URL: http://api:8080
+      # Tema uygulamasının "kendi" adresi → router adresi (tema siteleri
+      # router üzerinden servis edilir).
+      SITE_URL: "https://sites.${ROOT_DOMAIN:-webyono.com}"
+      NODE_ENV: production
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      edge:
+        # Router bu ada ile çözer: `http://theme-<slug>:3000`
+        # (compose servis adı interpolate EDİLEMEZ → alias ile çözülür).
+        aliases:
+          - theme-egitim-kurs
+    # NO `ports:` — host'a publish edilmez.
+    # NO Traefik label — doğrudan public erişim YOK (host → router proxy).
+
+  theme-perakende-magaza:
+    # ADR-0022 (K22) — registry referansı. `THEME_IMAGE` tanımlıysa CI'da
+    # push edilen imaj kullanılır; `pull_policy: always` ile sunucu her
+    # deploy'da registry'den çeker (build YOK → build cache 0).
+    image: ghcr.io/anilcetin/waas-theme-perakende-magaza:prod
+    container_name: waas-theme-perakende-magaza
+    restart: unless-stopped
+    environment:
+      # Platform API — SUNUCU TARAFI (theme-runtime `readApiUrl`).
+      # `edge` ağındaki API servisinin İÇ adresi (public DNS/TLS turu yok).
+      API_URL: http://api:8080
+      # Client bundle'a build-time inline edilir → PUBLIC adres olmalı.
+      NEXT_PUBLIC_API_URL: "https://api.${ROOT_DOMAIN:-webyono.com}"
+      # Sunucu-only alternatif (readApiUrl öncelik listesi).
+      PLATFORM_API_URL: http://api:8080
+      # Tema uygulamasının "kendi" adresi → router adresi (tema siteleri
+      # router üzerinden servis edilir).
+      SITE_URL: "https://sites.${ROOT_DOMAIN:-webyono.com}"
+      NODE_ENV: production
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      edge:
+        # Router bu ada ile çözer: `http://theme-<slug>:3000`
+        # (compose servis adı interpolate EDİLEMEZ → alias ile çözülür).
+        aliases:
+          - theme-perakende-magaza
+    # NO `ports:` — host'a publish edilmez.
+    # NO Traefik label — doğrudan public erişim YOK (host → router proxy).
+
+  theme-otel-konaklama:
+    # ADR-0022 (K22) — registry referansı. `THEME_IMAGE` tanımlıysa CI'da
+    # push edilen imaj kullanılır; `pull_policy: always` ile sunucu her
+    # deploy'da registry'den çeker (build YOK → build cache 0).
+    image: ghcr.io/anilcetin/waas-theme-otel-konaklama:prod
+    container_name: waas-theme-otel-konaklama
+    restart: unless-stopped
+    environment:
+      # Platform API — SUNUCU TARAFI (theme-runtime `readApiUrl`).
+      # `edge` ağındaki API servisinin İÇ adresi (public DNS/TLS turu yok).
+      API_URL: http://api:8080
+      # Client bundle'a build-time inline edilir → PUBLIC adres olmalı.
+      NEXT_PUBLIC_API_URL: "https://api.${ROOT_DOMAIN:-webyono.com}"
+      # Sunucu-only alternatif (readApiUrl öncelik listesi).
+      PLATFORM_API_URL: http://api:8080
+      # Tema uygulamasının "kendi" adresi → router adresi (tema siteleri
+      # router üzerinden servis edilir).
+      SITE_URL: "https://sites.${ROOT_DOMAIN:-webyono.com}"
+      NODE_ENV: production
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      edge:
+        # Router bu ada ile çözer: `http://theme-<slug>:3000`
+        # (compose servis adı interpolate EDİLEMEZ → alias ile çözülür).
+        aliases:
+          - theme-otel-konaklama
+    # NO `ports:` — host'a publish edilmez.
+    # NO Traefik label — doğrudan public erişim YOK (host → router proxy).
+
+  theme-spor-salonu:
+    # ADR-0022 (K22) — registry referansı. `THEME_IMAGE` tanımlıysa CI'da
+    # push edilen imaj kullanılır; `pull_policy: always` ile sunucu her
+    # deploy'da registry'den çeker (build YOK → build cache 0).
+    image: ghcr.io/anilcetin/waas-theme-spor-salonu:prod
+    container_name: waas-theme-spor-salonu
+    restart: unless-stopped
+    environment:
+      # Platform API — SUNUCU TARAFI (theme-runtime `readApiUrl`).
+      # `edge` ağındaki API servisinin İÇ adresi (public DNS/TLS turu yok).
+      API_URL: http://api:8080
+      # Client bundle'a build-time inline edilir → PUBLIC adres olmalı.
+      NEXT_PUBLIC_API_URL: "https://api.${ROOT_DOMAIN:-webyono.com}"
+      # Sunucu-only alternatif (readApiUrl öncelik listesi).
+      PLATFORM_API_URL: http://api:8080
+      # Tema uygulamasının "kendi" adresi → router adresi (tema siteleri
+      # router üzerinden servis edilir).
+      SITE_URL: "https://sites.${ROOT_DOMAIN:-webyono.com}"
+      NODE_ENV: production
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      edge:
+        # Router bu ada ile çözer: `http://theme-<slug>:3000`
+        # (compose servis adı interpolate EDİLEMEZ → alias ile çözülür).
+        aliases:
+          - theme-spor-salonu
+    # NO `ports:` — host'a publish edilmez.
+    # NO Traefik label — doğrudan public erişim YOK (host → router proxy).
+
+  theme-restoran-kafe-modern:
+    # ADR-0022 (K22) — registry referansı. `THEME_IMAGE` tanımlıysa CI'da
+    # push edilen imaj kullanılır; `pull_policy: always` ile sunucu her
+    # deploy'da registry'den çeker (build YOK → build cache 0).
+    image: ghcr.io/anilcetin/waas-theme-restoran-kafe-modern:prod
+    container_name: waas-theme-restoran-kafe-modern
+    restart: unless-stopped
+    environment:
+      # Platform API — SUNUCU TARAFI (theme-runtime `readApiUrl`).
+      # `edge` ağındaki API servisinin İÇ adresi (public DNS/TLS turu yok).
+      API_URL: http://api:8080
+      # Client bundle'a build-time inline edilir → PUBLIC adres olmalı.
+      NEXT_PUBLIC_API_URL: "https://api.${ROOT_DOMAIN:-webyono.com}"
+      # Sunucu-only alternatif (readApiUrl öncelik listesi).
+      PLATFORM_API_URL: http://api:8080
+      # Tema uygulamasının "kendi" adresi → router adresi (tema siteleri
+      # router üzerinden servis edilir).
+      SITE_URL: "https://sites.${ROOT_DOMAIN:-webyono.com}"
+      NODE_ENV: production
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      edge:
+        # Router bu ada ile çözer: `http://theme-<slug>:3000`
+        # (compose servis adı interpolate EDİLEMEZ → alias ile çözülür).
+        aliases:
+          - theme-restoran-kafe-modern
+    # NO `ports:` — host'a publish edilmez.
+    # NO Traefik label — doğrudan public erişim YOK (host → router proxy).
+
+  theme-kuafor-guzellik-elegant:
+    # ADR-0022 (K22) — registry referansı. `THEME_IMAGE` tanımlıysa CI'da
+    # push edilen imaj kullanılır; `pull_policy: always` ile sunucu her
+    # deploy'da registry'den çeker (build YOK → build cache 0).
+    image: ghcr.io/anilcetin/waas-theme-kuafor-guzellik-elegant:prod
+    container_name: waas-theme-kuafor-guzellik-elegant
+    restart: unless-stopped
+    environment:
+      # Platform API — SUNUCU TARAFI (theme-runtime `readApiUrl`).
+      # `edge` ağındaki API servisinin İÇ adresi (public DNS/TLS turu yok).
+      API_URL: http://api:8080
+      # Client bundle'a build-time inline edilir → PUBLIC adres olmalı.
+      NEXT_PUBLIC_API_URL: "https://api.${ROOT_DOMAIN:-webyono.com}"
+      # Sunucu-only alternatif (readApiUrl öncelik listesi).
+      PLATFORM_API_URL: http://api:8080
+      # Tema uygulamasının "kendi" adresi → router adresi (tema siteleri
+      # router üzerinden servis edilir).
+      SITE_URL: "https://sites.${ROOT_DOMAIN:-webyono.com}"
+      NODE_ENV: production
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      edge:
+        # Router bu ada ile çözer: `http://theme-<slug>:3000`
+        # (compose servis adı interpolate EDİLEMEZ → alias ile çözülür).
+        aliases:
+          - theme-kuafor-guzellik-elegant
+    # NO `ports:` — host'a publish edilmez.
+    # NO Traefik label — doğrudan public erişim YOK (host → router proxy).
+
+  theme-hukuk-burosu-cekim:
+    # ADR-0022 (K22) — registry referansı. `THEME_IMAGE` tanımlıysa CI'da
+    # push edilen imaj kullanılır; `pull_policy: always` ile sunucu her
+    # deploy'da registry'den çeker (build YOK → build cache 0).
+    image: ghcr.io/anilcetin/waas-theme-hukuk-burosu-cekim:prod
+    container_name: waas-theme-hukuk-burosu-cekim
+    restart: unless-stopped
+    environment:
+      # Platform API — SUNUCU TARAFI (theme-runtime `readApiUrl`).
+      # `edge` ağındaki API servisinin İÇ adresi (public DNS/TLS turu yok).
+      API_URL: http://api:8080
+      # Client bundle'a build-time inline edilir → PUBLIC adres olmalı.
+      NEXT_PUBLIC_API_URL: "https://api.${ROOT_DOMAIN:-webyono.com}"
+      # Sunucu-only alternatif (readApiUrl öncelik listesi).
+      PLATFORM_API_URL: http://api:8080
+      # Tema uygulamasının "kendi" adresi → router adresi (tema siteleri
+      # router üzerinden servis edilir).
+      SITE_URL: "https://sites.${ROOT_DOMAIN:-webyono.com}"
+      NODE_ENV: production
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      edge:
+        # Router bu ada ile çözer: `http://theme-<slug>:3000`
+        # (compose servis adı interpolate EDİLEMEZ → alias ile çözülür).
+        aliases:
+          - theme-hukuk-burosu-cekim
+    # NO `ports:` — host'a publish edilmez.
+    # NO Traefik label — doğrudan public erişim YOK (host → router proxy).
+
+  theme-emlak-vitrin-modern:
+    # ADR-0022 (K22) — registry referansı. `THEME_IMAGE` tanımlıysa CI'da
+    # push edilen imaj kullanılır; `pull_policy: always` ile sunucu her
+    # deploy'da registry'den çeker (build YOK → build cache 0).
+    image: ghcr.io/anilcetin/waas-theme-emlak-vitrin-modern:prod
+    container_name: waas-theme-emlak-vitrin-modern
+    restart: unless-stopped
+    environment:
+      # Platform API — SUNUCU TARAFI (theme-runtime `readApiUrl`).
+      # `edge` ağındaki API servisinin İÇ adresi (public DNS/TLS turu yok).
+      API_URL: http://api:8080
+      # Client bundle'a build-time inline edilir → PUBLIC adres olmalı.
+      NEXT_PUBLIC_API_URL: "https://api.${ROOT_DOMAIN:-webyono.com}"
+      # Sunucu-only alternatif (readApiUrl öncelik listesi).
+      PLATFORM_API_URL: http://api:8080
+      # Tema uygulamasının "kendi" adresi → router adresi (tema siteleri
+      # router üzerinden servis edilir).
+      SITE_URL: "https://sites.${ROOT_DOMAIN:-webyono.com}"
+      NODE_ENV: production
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      edge:
+        # Router bu ada ile çözer: `http://theme-<slug>:3000`
+        # (compose servis adı interpolate EDİLEMEZ → alias ile çözülür).
+        aliases:
+          - theme-emlak-vitrin-modern
+    # NO `ports:` — host'a publish edilmez.
+    # NO Traefik label — doğrudan public erişim YOK (host → router proxy).
+
+  theme-dis-klinik-modern:
+    # ADR-0022 (K22) — registry referansı. `THEME_IMAGE` tanımlıysa CI'da
+    # push edilen imaj kullanılır; `pull_policy: always` ile sunucu her
+    # deploy'da registry'den çeker (build YOK → build cache 0).
+    image: ghcr.io/anilcetin/waas-theme-dis-klinik-modern:prod
+    container_name: waas-theme-dis-klinik-modern
+    restart: unless-stopped
+    environment:
+      # Platform API — SUNUCU TARAFI (theme-runtime `readApiUrl`).
+      # `edge` ağındaki API servisinin İÇ adresi (public DNS/TLS turu yok).
+      API_URL: http://api:8080
+      # Client bundle'a build-time inline edilir → PUBLIC adres olmalı.
+      NEXT_PUBLIC_API_URL: "https://api.${ROOT_DOMAIN:-webyono.com}"
+      # Sunucu-only alternatif (readApiUrl öncelik listesi).
+      PLATFORM_API_URL: http://api:8080
+      # Tema uygulamasının "kendi" adresi → router adresi (tema siteleri
+      # router üzerinden servis edilir).
+      SITE_URL: "https://sites.${ROOT_DOMAIN:-webyono.com}"
+      NODE_ENV: production
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      edge:
+        # Router bu ada ile çözer: `http://theme-<slug>:3000`
+        # (compose servis adı interpolate EDİLEMEZ → alias ile çözülür).
+        aliases:
+          - theme-dis-klinik-modern
+    # NO `ports:` — host'a publish edilmez.
+    # NO Traefik label — doğrudan public erişim YOK (host → router proxy).
+
+  theme-insaat-yapi-modern:
+    # ADR-0022 (K22) — registry referansı. `THEME_IMAGE` tanımlıysa CI'da
+    # push edilen imaj kullanılır; `pull_policy: always` ile sunucu her
+    # deploy'da registry'den çeker (build YOK → build cache 0).
+    image: ghcr.io/anilcetin/waas-theme-insaat-yapi-modern:prod
+    container_name: waas-theme-insaat-yapi-modern
+    restart: unless-stopped
+    environment:
+      # Platform API — SUNUCU TARAFI (theme-runtime `readApiUrl`).
+      # `edge` ağındaki API servisinin İÇ adresi (public DNS/TLS turu yok).
+      API_URL: http://api:8080
+      # Client bundle'a build-time inline edilir → PUBLIC adres olmalı.
+      NEXT_PUBLIC_API_URL: "https://api.${ROOT_DOMAIN:-webyono.com}"
+      # Sunucu-only alternatif (readApiUrl öncelik listesi).
+      PLATFORM_API_URL: http://api:8080
+      # Tema uygulamasının "kendi" adresi → router adresi (tema siteleri
+      # router üzerinden servis edilir).
+      SITE_URL: "https://sites.${ROOT_DOMAIN:-webyono.com}"
+      NODE_ENV: production
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      edge:
+        # Router bu ada ile çözer: `http://theme-<slug>:3000`
+        # (compose servis adı interpolate EDİLEMEZ → alias ile çözülür).
+        aliases:
+          - theme-insaat-yapi-modern
+    # NO `ports:` — host'a publish edilmez.
+    # NO Traefik label — doğrudan public erişim YOK (host → router proxy).
+
+  theme-egitim-kurs-online:
+    # ADR-0022 (K22) — registry referansı. `THEME_IMAGE` tanımlıysa CI'da
+    # push edilen imaj kullanılır; `pull_policy: always` ile sunucu her
+    # deploy'da registry'den çeker (build YOK → build cache 0).
+    image: ghcr.io/anilcetin/waas-theme-egitim-kurs-online:prod
+    container_name: waas-theme-egitim-kurs-online
+    restart: unless-stopped
+    environment:
+      # Platform API — SUNUCU TARAFI (theme-runtime `readApiUrl`).
+      # `edge` ağındaki API servisinin İÇ adresi (public DNS/TLS turu yok).
+      API_URL: http://api:8080
+      # Client bundle'a build-time inline edilir → PUBLIC adres olmalı.
+      NEXT_PUBLIC_API_URL: "https://api.${ROOT_DOMAIN:-webyono.com}"
+      # Sunucu-only alternatif (readApiUrl öncelik listesi).
+      PLATFORM_API_URL: http://api:8080
+      # Tema uygulamasının "kendi" adresi → router adresi (tema siteleri
+      # router üzerinden servis edilir).
+      SITE_URL: "https://sites.${ROOT_DOMAIN:-webyono.com}"
+      NODE_ENV: production
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      edge:
+        # Router bu ada ile çözer: `http://theme-<slug>:3000`
+        # (compose servis adı interpolate EDİLEMEZ → alias ile çözülür).
+        aliases:
+          - theme-egitim-kurs-online
+    # NO `ports:` — host'a publish edilmez.
+    # NO Traefik label — doğrudan public erişim YOK (host → router proxy).
+
+  theme-perakende-magaza-modern:
+    # ADR-0022 (K22) — registry referansı. `THEME_IMAGE` tanımlıysa CI'da
+    # push edilen imaj kullanılır; `pull_policy: always` ile sunucu her
+    # deploy'da registry'den çeker (build YOK → build cache 0).
+    image: ghcr.io/anilcetin/waas-theme-perakende-magaza-modern:prod
+    container_name: waas-theme-perakende-magaza-modern
+    restart: unless-stopped
+    environment:
+      # Platform API — SUNUCU TARAFI (theme-runtime `readApiUrl`).
+      # `edge` ağındaki API servisinin İÇ adresi (public DNS/TLS turu yok).
+      API_URL: http://api:8080
+      # Client bundle'a build-time inline edilir → PUBLIC adres olmalı.
+      NEXT_PUBLIC_API_URL: "https://api.${ROOT_DOMAIN:-webyono.com}"
+      # Sunucu-only alternatif (readApiUrl öncelik listesi).
+      PLATFORM_API_URL: http://api:8080
+      # Tema uygulamasının "kendi" adresi → router adresi (tema siteleri
+      # router üzerinden servis edilir).
+      SITE_URL: "https://sites.${ROOT_DOMAIN:-webyono.com}"
+      NODE_ENV: production
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      edge:
+        # Router bu ada ile çözer: `http://theme-<slug>:3000`
+        # (compose servis adı interpolate EDİLEMEZ → alias ile çözülür).
+        aliases:
+          - theme-perakende-magaza-modern
+    # NO `ports:` — host'a publish edilmez.
+    # NO Traefik label — doğrudan public erişim YOK (host → router proxy).
+
+  theme-otel-boutique:
+    # ADR-0022 (K22) — registry referansı. `THEME_IMAGE` tanımlıysa CI'da
+    # push edilen imaj kullanılır; `pull_policy: always` ile sunucu her
+    # deploy'da registry'den çeker (build YOK → build cache 0).
+    image: ghcr.io/anilcetin/waas-theme-otel-boutique:prod
+    container_name: waas-theme-otel-boutique
+    restart: unless-stopped
+    environment:
+      # Platform API — SUNUCU TARAFI (theme-runtime `readApiUrl`).
+      # `edge` ağındaki API servisinin İÇ adresi (public DNS/TLS turu yok).
+      API_URL: http://api:8080
+      # Client bundle'a build-time inline edilir → PUBLIC adres olmalı.
+      NEXT_PUBLIC_API_URL: "https://api.${ROOT_DOMAIN:-webyono.com}"
+      # Sunucu-only alternatif (readApiUrl öncelik listesi).
+      PLATFORM_API_URL: http://api:8080
+      # Tema uygulamasının "kendi" adresi → router adresi (tema siteleri
+      # router üzerinden servis edilir).
+      SITE_URL: "https://sites.${ROOT_DOMAIN:-webyono.com}"
+      NODE_ENV: production
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      edge:
+        # Router bu ada ile çözer: `http://theme-<slug>:3000`
+        # (compose servis adı interpolate EDİLEMEZ → alias ile çözülür).
+        aliases:
+          - theme-otel-boutique
+    # NO `ports:` — host'a publish edilmez.
+    # NO Traefik label — doğrudan public erişim YOK (host → router proxy).
+
+  theme-spor-salonu-modern:
+    # ADR-0022 (K22) — registry referansı. `THEME_IMAGE` tanımlıysa CI'da
+    # push edilen imaj kullanılır; `pull_policy: always` ile sunucu her
+    # deploy'da registry'den çeker (build YOK → build cache 0).
+    image: ghcr.io/anilcetin/waas-theme-spor-salonu-modern:prod
+    container_name: waas-theme-spor-salonu-modern
+    restart: unless-stopped
+    environment:
+      # Platform API — SUNUCU TARAFI (theme-runtime `readApiUrl`).
+      # `edge` ağındaki API servisinin İÇ adresi (public DNS/TLS turu yok).
+      API_URL: http://api:8080
+      # Client bundle'a build-time inline edilir → PUBLIC adres olmalı.
+      NEXT_PUBLIC_API_URL: "https://api.${ROOT_DOMAIN:-webyono.com}"
+      # Sunucu-only alternatif (readApiUrl öncelik listesi).
+      PLATFORM_API_URL: http://api:8080
+      # Tema uygulamasının "kendi" adresi → router adresi (tema siteleri
+      # router üzerinden servis edilir).
+      SITE_URL: "https://sites.${ROOT_DOMAIN:-webyono.com}"
+      NODE_ENV: production
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      edge:
+        # Router bu ada ile çözer: `http://theme-<slug>:3000`
+        # (compose servis adı interpolate EDİLEMEZ → alias ile çözülür).
+        aliases:
+          - theme-spor-salonu-modern
+    # NO `ports:` — host'a publish edilmez.
+    # NO Traefik label — doğrudan public erişim YOK (host → router proxy).
+
+  theme-dis-klinik-luxe:
+    # ADR-0022 (K22) — registry referansı. `THEME_IMAGE` tanımlıysa CI'da
+    # push edilen imaj kullanılır; `pull_policy: always` ile sunucu her
+    # deploy'da registry'den çeker (build YOK → build cache 0).
+    image: ghcr.io/anilcetin/waas-theme-dis-klinik-luxe:prod
+    container_name: waas-theme-dis-klinik-luxe
+    restart: unless-stopped
+    environment:
+      # Platform API — SUNUCU TARAFI (theme-runtime `readApiUrl`).
+      # `edge` ağındaki API servisinin İÇ adresi (public DNS/TLS turu yok).
+      API_URL: http://api:8080
+      # Client bundle'a build-time inline edilir → PUBLIC adres olmalı.
+      NEXT_PUBLIC_API_URL: "https://api.${ROOT_DOMAIN:-webyono.com}"
+      # Sunucu-only alternatif (readApiUrl öncelik listesi).
+      PLATFORM_API_URL: http://api:8080
+      # Tema uygulamasının "kendi" adresi → router adresi (tema siteleri
+      # router üzerinden servis edilir).
+      SITE_URL: "https://sites.${ROOT_DOMAIN:-webyono.com}"
+      NODE_ENV: production
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      edge:
+        # Router bu ada ile çözer: `http://theme-<slug>:3000`
+        # (compose servis adı interpolate EDİLEMEZ → alias ile çözülür).
+        aliases:
+          - theme-dis-klinik-luxe
+    # NO `ports:` — host'a publish edilmez.
+    # NO Traefik label — doğrudan public erişim YOK (host → router proxy).
+
+  theme-restoran-kafe-bistro:
+    # ADR-0022 (K22) — registry referansı. `THEME_IMAGE` tanımlıysa CI'da
+    # push edilen imaj kullanılır; `pull_policy: always` ile sunucu her
+    # deploy'da registry'den çeker (build YOK → build cache 0).
+    image: ghcr.io/anilcetin/waas-theme-restoran-kafe-bistro:prod
+    container_name: waas-theme-restoran-kafe-bistro
+    restart: unless-stopped
+    environment:
+      # Platform API — SUNUCU TARAFI (theme-runtime `readApiUrl`).
+      # `edge` ağındaki API servisinin İÇ adresi (public DNS/TLS turu yok).
+      API_URL: http://api:8080
+      # Client bundle'a build-time inline edilir → PUBLIC adres olmalı.
+      NEXT_PUBLIC_API_URL: "https://api.${ROOT_DOMAIN:-webyono.com}"
+      # Sunucu-only alternatif (readApiUrl öncelik listesi).
+      PLATFORM_API_URL: http://api:8080
+      # Tema uygulamasının "kendi" adresi → router adresi (tema siteleri
+      # router üzerinden servis edilir).
+      SITE_URL: "https://sites.${ROOT_DOMAIN:-webyono.com}"
+      NODE_ENV: production
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      edge:
+        # Router bu ada ile çözer: `http://theme-<slug>:3000`
+        # (compose servis adı interpolate EDİLEMEZ → alias ile çözülür).
+        aliases:
+          - theme-restoran-kafe-bistro
+    # NO `ports:` — host'a publish edilmez.
+    # NO Traefik label — doğrudan public erişim YOK (host → router proxy).
+networks:
+  platform-internal:
+    driver: bridge
+    name: waas-platform-internal-prod
+  edge:
+    external: true
+    name: coolify
+
+volumes:
+  postgres_data_prod:
+    name: waas-postgres-data-prod
+  waas_media_prod:
+    name: waas-media-data-prod
