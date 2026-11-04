@@ -1,0 +1,2 @@
+[01:56:03] host deploy basladi (pwd=/app)
+[01:56:03] docker: /usr/local/bin/docker
