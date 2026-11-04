@@ -1,29 +1,46 @@
 #!/bin/sh
 # Faz 1 bootstrap — Coolify uygulamasi olarak calisir.
+#
 # Docker socket uzerinden host daemon'ina baglanir ve prod compose'u
-# ayağa kaldirir.
-set -eu
+# ayağa kaldirir. Tum adimlar GitHub'a log olarak yazilir (public repo)
+# → ag üzerinden log okunamasa bile durum görülebilir.
+set -u
 
-REPO='anilcetin/business-platform'
-BRANCH='main'
-BASE="https://api.github.com/repos/${REPO}/contents"
-GH_USER='anilcetin'
-WORK=/tmp/waas
+LOG=/tmp/waas-bootstrap.log
+: > "${LOG}"
 
-echo "[bootstrap] basladi"
+say() {
+  echo "[$(date -u +%H:%M:%S)] $*" >> "${LOG}"
+  publish
+}
 
-mkdir -p "${WORK}" /host/waas/postgres-init
+publish() {
+  content=$(base64 < "${LOG}" 2>/dev/null | tr -d '\\n')
+  printf '{"message":"bootstrap log","content":"%s","branch":"main"}' "${content}" > /tmp/waas-payload.json
+  curl -s -X PUT 
+    -H "Authorization: Bearer ${GITHUB_TOKEN}" 
+    -H "Accept: application/vnd.github+json" 
+    -H "Content-Type: application/json" 
+    --data @/tmp/waas-payload.json 
+    "https://api.github.com/repos/anilcetin/waas-deploy/contents/bootstrap.log" 
+    >/dev/null 2>&1 || true
+}
 
-# --- 1) Postgres init betigi (host'a kopyala) ---------------------------
+trap publish EXIT
+
+say "bootstrap basladi"
+say "docker socket: $(ls -la /var/run/docker.sock 2>&1 | head -1)"
+say "docker CLI: $(command -v docker 2>&1)"
+say "compose: $(docker compose version 2>&1 | head -1)"
+
+mkdir -p /tmp/waas /host/waas/postgres-init
 cp /app/postgres-init/*.sql /host/waas/postgres-init/ 2>/dev/null || true
-echo "[bootstrap] postgres-init kopyalandi"
+say "postgres-init kopyalandi"
 
-# --- 2) Registry girisi --------------------------------------------------
-echo "${GITHUB_TOKEN}" | docker login ghcr.io -u "${GH_USER}" --password-stdin
-echo "[bootstrap] ghcr.io girisi tamam"
+echo "${GITHUB_TOKEN}" | docker login ghcr.io -u anilcetin --password-stdin >> "${LOG}" 2>&1
+say "ghcr.io girisi: $?"
 
-# --- 3) .env (compose icin) ---------------------------------------------
-cat > "${WORK}/.env" <<EOF
+cat > /tmp/waas/.env <<EOF
 ROOT_DOMAIN=${ROOT_DOMAIN}
 POSTGRES_USER=${POSTGRES_USER}
 POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
@@ -52,29 +69,27 @@ Email__FromEmail=${Email__FromEmail}
 Email__FromName=${Email__FromName}
 Email__NotificationRecipient=${Email__NotificationRecipient}
 EOF
-echo "[bootstrap] .env yazildi"
+say ".env yazildi"
 
-# --- 4) Ag ---------------------------------------------------------------
 docker network inspect coolify >/dev/null 2>&1 || docker network create coolify >/dev/null
+say "ag hazir"
 
-# --- 5) Imajlari cek -----------------------------------------------------
 attempt=0
-until docker compose --env-file "${WORK}/.env" -f "${WORK}/compose.yml" pull; do
-  attempt=$((attempt + 1))
+until docker compose --env-file /tmp/waas/.env -f /app/compose.yml pull >> "${LOG}" 2>&1; do
+  attempt=\$((attempt + 1))
   if [ "${attempt}" -ge 90 ]; then
-    echo "[bootstrap] imaj cekme basarisiz"
-    exit 1
+    say "imaj cekme basarisiz (90 deneme)"
+    break
   fi
-  echo "[bootstrap] imajlar hazir degil, tekrar deneniyor (${attempt}/90)"
+  say "imajlar hazir degil, tekrar deneniyor (${attempt}/90)"
   sleep 20
 done
-echo "[bootstrap] imajlar cekildi"
+say "imaj cekme bitti"
 
-# --- 6) Ayağa kaldir ------------------------------------------------------
-docker compose --env-file "${WORK}/.env" -f "${WORK}/compose.yml" up -d --remove-orphans
-docker compose --env-file "${WORK}/.env" -f "${WORK}/compose.yml" ps
+docker compose --env-file /tmp/waas/.env -f /app/compose.yml up -d --remove-orphans >> "${LOG}" 2>&1
+say "compose up cikisi: $?"
 
-echo "[bootstrap] TAMAMLANDI"
+docker compose --env-file /tmp/waas/.env -f /app/compose.yml ps >> "${LOG}" 2>&1
+say "TAMAMLANDI"
 
-# Container ayakta kalsin (yeniden deploy mumkun olsun).
 exec tail -f /dev/null
